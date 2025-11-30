@@ -1,3 +1,4 @@
+
 import asyncio
 import logging
 import ipaddress
@@ -6,6 +7,23 @@ import struct
 # Global connection counter and lock
 active_connections = 0
 active_connections_lock = asyncio.Lock()
+
+# TCP/UDP connection classes for logging and management
+class TCPConnection:
+    def __init__(self, client_addr, dst_addr, dst_port):
+        self.client_addr = client_addr
+        self.dst_addr = dst_addr
+        self.dst_port = dst_port
+    def close(self):
+        pass
+
+class UDPConnection:
+    def __init__(self, client_addr, dst_addr, dst_port):
+        self.client_addr = client_addr
+        self.dst_addr = dst_addr
+        self.dst_port = dst_port
+    def close(self):
+        pass
 
 async def handle_data(reader, writer):
     """
@@ -32,7 +50,6 @@ async def handle_socks5(reader, writer):
         # Increase connection count
         async with active_connections_lock:
             active_connections += 1
-            logging.info(f"Active connections: {active_connections}")
 
         # SOCKS5 greeting
         # Read the first two bytes: protocol version and number of auth methods
@@ -70,8 +87,26 @@ async def handle_socks5(reader, writer):
             await writer.wait_closed()
             return
         
-        if cmd != 0x01:
-            # Only support CONNECT command
+        if cmd == 0x01:
+            # CONNECT (TCP)
+            pass  # continue below
+        elif cmd == 0x03:
+            # UDP ASSOCIATE
+            # 回應client一個UDP綁定地址（這裡用127.0.0.1:55555），並log
+            bound_addr = ipaddress.IPv4Address('127.0.0.1')
+            bound_port = 55555
+            reply = bytearray([0x05, 0x00, 0x00, 0x01]) + bound_addr.packed + struct.pack("!H", bound_port)
+            writer.write(reply)
+            await writer.drain()
+            # log UDP connection
+            client_addr = writer.get_extra_info('peername')
+            udp_conn = UDPConnection(client_addr, bound_addr, bound_port)
+            # UDP資料通道需額外設計，這裡僅回應成功避免connect call failed
+            writer.close()
+            await writer.wait_closed()
+            return
+        else:
+            # 不支援的cmd
             reply = bytearray([0x05, 0x07, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
             writer.write(reply)
             await writer.drain()
@@ -102,7 +137,7 @@ async def handle_socks5(reader, writer):
         port_data = await reader.readexactly(2)
         dst_port = struct.unpack("!H", port_data)[0]
 
-        logging.info("Connecting to %s:%d", dst_addr, dst_port)
+        # logging.info("Connecting to %s:%d", dst_addr, dst_port)
 
         # Connect to the destination
         try:
@@ -158,20 +193,18 @@ async def handle_socks5(reader, writer):
         # Decrease connection count
         async with active_connections_lock:
             active_connections -= 1
-            logging.info(f"Active connections: {active_connections}")
 
 async def main():
     """
     Main function to run the SOCKS5 server.
     """
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(level=logging.ERROR)
     try:
         server = await asyncio.start_server(
             handle_socks5, '172.20.10.1', 9876
         )
-        addr = server.sockets[0].getsockname()
-        logging.info("Serving on %s", addr)
-        
+        # addr = server.sockets[0].getsockname()
+        # logging.info("Serving on %s", addr)
         async with server:
             await server.serve_forever()
     except Exception as e:
