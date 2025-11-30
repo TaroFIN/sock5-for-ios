@@ -46,6 +46,7 @@ async def handle_socks5(reader, writer):
     """
     loop = asyncio.get_running_loop()  # 用於 async 操作
     udp_transport = None  # 初始化 UDP transport 變數
+    shared_udp_sock = None  # 初始化共享 UDP socket
     try:
         # SOCKS5 greeting
         # Read the first two bytes: protocol version and number of auth methods
@@ -96,7 +97,8 @@ async def handle_socks5(reader, writer):
                 def __init__(self):
                     self.client_addrs = set()  # 追蹤客戶端位址
                     self.tasks = set()  # 追蹤所有 handle_datagram 任務
-                    self.sem = asyncio.Semaphore(50)  # 新增：限制並發轉發，調整數字以匹配系統限制
+                    self.shared_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)  # 共享 socket
+                    self.shared_sock.settimeout(5)  # 全局超時
                     
                 def connection_made(self, transport):
                     self.transport = transport
@@ -111,48 +113,46 @@ async def handle_socks5(reader, writer):
                     task.add_done_callback(self.tasks.discard)
                 
                 async def handle_datagram(self, data, addr):
-                    async with self.sem:  # 限制並發
-                        try:
-                            if len(data) < 10:
-                                return
-                            rsv, frag, atyp = struct.unpack("!HBB", data[:4])
-                            if frag != 0:
-                                return
-                            offset = 4
-                            if atyp == 0x01:
-                                dst_addr = ipaddress.IPv4Address(data[offset:offset+4]).exploded
-                                offset += 4
-                            elif atyp == 0x03:
-                                dlen = data[offset]
-                                dst_addr = data[offset+1:offset+1+dlen].decode('utf-8')
-                                offset += 1 + dlen
-                            else:
-                                return
-                            dst_port = struct.unpack("!H", data[offset:offset+2])[0]
-                            payload = data[offset+2:]
-                            
-                            def forward_and_receive():
-                                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as dst_sock:
-                                    dst_sock.settimeout(5)
-                                    dst_sock.sendto(payload, (dst_addr, dst_port))
-                                    resp, src_addr = dst_sock.recvfrom(4096)
-                                    return resp, src_addr
-                            
-                            resp, src_addr = await loop.run_in_executor(None, forward_and_receive)
-                            
-                            header = struct.pack("!HBB", 0, 0, 0x01) + ipaddress.IPv4Address(src_addr[0]).packed + struct.pack("!H", src_addr[1])
-                            self.transport.sendto(header + resp, addr)
-                        except socket.timeout:
-                            logging.error(f"[UDP] Timeout waiting for response from {dst_addr}:{dst_port}")
-                        except Exception as e:
-                            logging.error(f"[UDP] Error in relay: {e}")
-                        except asyncio.CancelledError:
-                            pass  # 忽略取消錯誤
+                    try:
+                        if len(data) < 10:
+                            return
+                        rsv, frag, atyp = struct.unpack("!HBB", data[:4])
+                        if frag != 0:
+                            return
+                        offset = 4
+                        if atyp == 0x01:
+                            dst_addr = ipaddress.IPv4Address(data[offset:offset+4]).exploded
+                            offset += 4
+                        elif atyp == 0x03:
+                            dlen = data[offset]
+                            dst_addr = data[offset+1:offset+1+dlen].decode('utf-8')
+                            offset += 1 + dlen
+                        else:
+                            return
+                        dst_port = struct.unpack("!H", data[offset:offset+2])[0]
+                        payload = data[offset+2:]
+                        
+                        def forward_and_receive():
+                            self.shared_sock.sendto(payload, (dst_addr, dst_port))
+                            resp, src_addr = self.shared_sock.recvfrom(4096)
+                            return resp, src_addr
+                        
+                        resp, src_addr = await loop.run_in_executor(None, forward_and_receive)
+                        
+                        header = struct.pack("!HBB", 0, 0, 0x01) + ipaddress.IPv4Address(src_addr[0]).packed + struct.pack("!H", src_addr[1])
+                        self.transport.sendto(header + resp, addr)
+                    except socket.timeout:
+                        logging.error(f"[UDP] Timeout waiting for response from {dst_addr}:{dst_port}")
+                    except Exception as e:
+                        logging.error(f"[UDP] Error in relay: {e}")
+                    except asyncio.CancelledError:
+                        pass  # 忽略取消錯誤
                 
                 def connection_lost(self, exc):
-                    # 當連線丟失時，取消所有任務
+                    # 當連線丟失時，取消所有任務並關閉共享 socket
                     for task in list(self.tasks):
                         task.cancel()
+                    self.shared_sock.close()
             
             # 建立 UDP endpoint，並獲取實際端口
             udp_transport, protocol = await loop.create_datagram_endpoint(
@@ -267,6 +267,8 @@ async def handle_socks5(reader, writer):
                 await asyncio.gather(*protocol.tasks, return_exceptions=True)
         if 'udp_conn' in locals():
             udp_conn.close()
+        if 'protocol' in locals() and hasattr(protocol, 'shared_sock'):
+            protocol.shared_sock.close()  # 確保共享 socket 關閉
 
 async def main():
     """
